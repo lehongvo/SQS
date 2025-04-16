@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { EZDRM_NFT_CONTRACT_ABI } from './abi';
 import axios from 'axios';
+import { DEFAULT_GAS_LIMIT } from './constant';
 
 interface PinataResponse {
   success: boolean;
@@ -18,15 +19,20 @@ export interface MetadataInfo {
   }>;
 }
 
-export const mintNft = async (
-  metadataInfo: MetadataInfo,
-  mintToAddress: string,
-): Promise<{
-  hash: string;
-  uri: string | null;
-  tokenId: string;
-  blockNumber: number;
-}> => {
+// Singleton provider and contract instances
+let providerInstance: ethers.JsonRpcProvider | null = null;
+let contractInstance: ethers.Contract | null = null;
+let walletInstance: ethers.Wallet | null = null;
+
+// Cache for gas prices - refresh every 10 blocks
+let cachedFeeData: ethers.FeeData | null = null;
+let lastFeeUpdateBlock = 0;
+
+/**
+ * Initialize the blockchain connection
+ * This should be called when the app starts
+ */
+export const initializeBlockchainConnection = () => {
   try {
     // Parse chain ID properly and ensure it's a valid number
     const chainId = parseInt(
@@ -46,7 +52,7 @@ export const mintNft = async (
     }
 
     // Create provider with validated network params
-    const provider = new ethers.JsonRpcProvider(
+    providerInstance = new ethers.JsonRpcProvider(
       process.env.NEXT_PUBLIC_RPC_URL,
       {
         chainId,
@@ -55,66 +61,129 @@ export const mintNft = async (
       { staticNetwork: true },
     );
 
-    const wallet = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
-    const contract = new ethers.Contract(
+    walletInstance = new ethers.Wallet(
+      process.env.PRIVATE_KEY!,
+      providerInstance,
+    );
+    contractInstance = new ethers.Contract(
       process.env.NEXT_PUBLIC_NFT_CONTRACT_ADDRESS!,
       EZDRM_NFT_CONTRACT_ABI,
-      wallet,
+      walletInstance,
     );
 
-    // get latest block, fee data and metadata
-    const [latestBlock, feeData, metadata] = await Promise.all([
-      provider.getBlock('latest'),
-      provider.getFeeData(),
-      uploadFileToAppPinata(metadataInfo),
-    ]);
+    console.log('Blockchain connection initialized successfully');
+    return true;
+  } catch (error) {
+    console.error('Error initializing blockchain connection:', error);
+    return false;
+  }
+};
 
+/**
+ * Get the current fee data, with caching
+ */
+const getFeeDataWithCache = async () => {
+  if (!providerInstance) {
+    await initializeBlockchainConnection();
+  }
+
+  try {
+    const latestBlock = await providerInstance!.getBlock('latest');
     if (!latestBlock) throw new Error('Could not get latest block');
 
-    const baseFee = latestBlock.baseFeePerGas;
-    if (!baseFee) throw new Error('Could not get base fee');
+    // If we have cached data and it's recent enough, use it
+    if (
+      cachedFeeData &&
+      latestBlock.number - lastFeeUpdateBlock < 10 // Cache for 10 blocks
+    ) {
+      return {
+        feeData: cachedFeeData,
+        latestBlock,
+      };
+    }
+
+    // Otherwise refresh the cache
+    const feeData = await providerInstance!.getFeeData();
     if (!feeData.maxFeePerGas || !feeData.maxPriorityFeePerGas) {
       throw new Error('Could not get fee data');
     }
 
+    cachedFeeData = feeData;
+    lastFeeUpdateBlock = latestBlock.number;
+
+    return {
+      feeData,
+      latestBlock,
+    };
+  } catch (error) {
+    console.error('Error getting fee data:', error);
+    throw error;
+  }
+};
+
+// Pre-calculated gas limit for common operations - can be adjusted based on contract
+export const mintNft = async (
+  metadataInfo: MetadataInfo,
+  mintToAddress: string,
+): Promise<{
+  hash: string;
+  uri: string | null;
+  // tokenId: string;
+  // blockNumber: number;
+}> => {
+  try {
+    // Make sure we have our singleton instances
+    if (!providerInstance || !contractInstance || !walletInstance) {
+      await initializeBlockchainConnection();
+    }
+
+    // Use Promise.all for concurrent operations
+    const [{ feeData, latestBlock }, metadata] = await Promise.all([
+      getFeeDataWithCache(),
+      uploadFileToAppPinata(metadataInfo),
+    ]);
+
     const uri = metadata.urlTransactionHash;
 
-    const etmGas = await contract.safeMint.estimateGas(mintToAddress, uri, {
-      from: wallet.address,
-    });
-
-    const tx = await contract.safeMint(mintToAddress, uri, {
-      gasLimit: etmGas,
+    // Apply EIP-1559 transaction with proper gasLimit
+    const tx = await contractInstance!.safeMint(mintToAddress, uri, {
+      gasLimit: DEFAULT_GAS_LIMIT, // Apply the gas limit here
       maxFeePerGas: feeData.maxFeePerGas,
       maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
-      from: wallet.address,
+      from: walletInstance!.address,
     });
 
-    const receipt = await tx.wait();
-    let tokenId = '0';
-    for (const log of receipt.logs) {
-      try {
-        const parsedLog = contract.interface.parseLog({
-          topics: log.topics,
-          data: log.data,
-        });
+    // console.log('Transaction submitted:', tx.hash);
 
-        if (parsedLog && parsedLog.name === 'Transfer') {
-          // Transfer(address from, address to, uint256 tokenId)
-          tokenId = parsedLog.args[2].toString();
-          console.log('Found tokenId from Transfer event:', tokenId);
-          break;
-        }
-      } catch (error) {
-        continue;
-      }
-    }
+    // // For very fast response, you could return the hash immediately and handle confirmation separately
+    // // But for now we'll still wait for receipt to maintain compatibility
+    // const receipt = await tx.wait();
+
+    // let tokenId = '0';
+    // // Process logs more efficiently with early return
+    // for (const log of receipt.logs) {
+    //   try {
+    //     const parsedLog = contractInstance!.interface.parseLog({
+    //       topics: log.topics,
+    //       data: log.data,
+    //     });
+
+    //     if (parsedLog && parsedLog.name === 'Transfer') {
+    //       // Transfer(address from, address to, uint256 tokenId)
+    //       tokenId = parsedLog.args[2].toString();
+    //       console.log('Found tokenId from Transfer event:', tokenId);
+    //       break;
+    //     }
+    //   } catch (error) {
+    //     continue;
+    //   }
+    // }
 
     return {
       hash: tx.hash,
       uri: uri,
-      tokenId,
-      blockNumber: receipt.blockNumber,
+      // tokenId,
+      // blockNumber: receipt.blockNumber,
     };
   } catch (error) {
     console.error('Error in mintNft:', error);
@@ -122,6 +191,7 @@ export const mintNft = async (
   }
 };
 
+// Improved Pinata upload function with timeout and optimized headers
 const uploadFileToAppPinata = async (
   metadataInfo: MetadataInfo,
 ): Promise<PinataResponse> => {
@@ -140,13 +210,7 @@ const uploadFileToAppPinata = async (
       !PINATA_SECRET_API_KEY ||
       !PINATA_CLOUD_URL
     ) {
-      console.error('Missing Pinata configuration:', {
-        url: !!url,
-        jwt: !!JWT,
-        apiKey: !!PINATA_API_KEY,
-        secretKey: !!PINATA_SECRET_API_KEY,
-        cloudUrl: !!PINATA_CLOUD_URL,
-      });
+      console.error('Missing Pinata configuration');
       return {
         success: false,
         urlTransactionHash: null,
@@ -161,30 +225,20 @@ const uploadFileToAppPinata = async (
     });
     form.append('file', metadataBlob, 'metadata.json');
 
-    // Add pinata options
+    // Add pinata options - simplified for speed
     const pinataOptions = JSON.stringify({
       cidVersion: 1,
-      customPinPolicy: {
-        regions: [
-          {
-            id: 'FRA1',
-            desiredReplicationCount: 1,
-          },
-          {
-            id: 'NYC1',
-            desiredReplicationCount: 1,
-          },
-        ],
-      },
     });
     form.append('pinataOptions', pinataOptions);
 
-    // Upload to Pinata with all authentication methods
+    // Upload to Pinata with timeout
     const response = await axios.post(url, form, {
       maxBodyLength: Infinity,
+      timeout: 5000, // 5 second timeout
       headers: {
         'Content-Type': `multipart/form-data`,
         Authorization: `Bearer ${JWT}`,
+        // Use only one auth method to reduce header size
         pinata_api_key: PINATA_API_KEY,
         pinata_secret_api_key: PINATA_SECRET_API_KEY,
       },
@@ -206,7 +260,7 @@ const uploadFileToAppPinata = async (
       message: 'Metadata pinned successfully to IPFS',
     };
   } catch (error: any) {
-    console.error('Error when mint nft:', {
+    console.error('Error when uploading to Pinata:', {
       message: error.message,
       response: error.response?.data,
     });
