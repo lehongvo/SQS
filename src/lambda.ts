@@ -6,7 +6,7 @@ import serverlessExpress from 'serverless-http';
 import express from 'express';
 import { AppModule } from './app.module';
 
-let cachedServer: any;
+let cachedServer: Handler;
 let app: INestApplication;
 
 async function bootstrap(): Promise<Handler> {
@@ -19,14 +19,10 @@ async function bootstrap(): Promise<Handler> {
     await app.init();
   }
 
-  return serverlessExpress(app.getHttpAdapter().getInstance());
+  return serverlessExpress({ app: app.getHttpAdapter().getInstance() });
 }
 
-export const handler: Handler = async (
-  event: any,
-  context: Context,
-  callback: any,
-) => {
+export const handler: Handler = async (event: any, context: Context) => {
   // Keep the Lambda warm
   context.callbackWaitsForEmptyEventLoop = false;
 
@@ -34,5 +30,5 @@ export const handler: Handler = async (
     cachedServer = await bootstrap();
   }
 
-  return cachedServer(event, context, callback);
+  return cachedServer(event, context);
 };

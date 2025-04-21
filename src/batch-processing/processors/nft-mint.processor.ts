@@ -1,13 +1,14 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Processor, Process, OnQueueFailed } from '@nestjs/bull';
+import { Logger } from '@nestjs/common';
+import { Job } from 'bull';
 import { ethers } from 'ethers';
 import { EZDRM_NFT_CONTRACT_ABI } from '../../utils/abi';
 import { DEFAULT_GAS_LIMIT } from '../../utils/constant';
 import { OrdersService } from '../../orders/orders.service';
 import { WalletsService } from '../../wallets/wallets.service';
-import { OrderStatus } from '../../orders/interfaces/order.interface';
+import { OrderStatus } from '../../orders/entities/order.entity';
 import { MetadataInfo } from '../../utils/contract';
 import axios from 'axios';
-import { Worker } from '../../wallets/interfaces/worker.interface';
 
 interface PinataResponse {
   success: boolean;
@@ -15,7 +16,7 @@ interface PinataResponse {
   message: string;
 }
 
-@Injectable()
+@Processor('nft-minting')
 export class NftMintProcessor {
   private readonly logger = new Logger(NftMintProcessor.name);
 
@@ -24,15 +25,22 @@ export class NftMintProcessor {
     private readonly walletsService: WalletsService,
   ) {}
 
-  async processBatch(batchId: string, orderIds: string[]) {
+  @Process('process-batch')
+  async processBatch(job: Job<{ batchId: string; orderIds: string[] }>) {
+    const { batchId, orderIds } = job.data;
     this.logger.log(
       `Processing batch ${batchId} with ${orderIds.length} orders`,
     );
 
     try {
-      // Get available worker
-      const worker = await this.getWorker();
-      this.logger.log(`Using worker ${worker.address} for batch ${batchId}`);
+      // Get available wallet
+      const wallet = await this.walletsService.getAvailableWallet();
+      this.logger.log(`Using wallet ${wallet.address} for batch ${batchId}`);
+
+      // Get wallet with private key
+      const walletWithKey = await this.walletsService.getWalletWithPrivateKey(
+        wallet.id,
+      );
 
       // Setup provider and contract
       const provider = new ethers.JsonRpcProvider(
@@ -46,23 +54,24 @@ export class NftMintProcessor {
         },
       );
 
-      // Create a wallet instance
-      const walletInstance = new ethers.Wallet(worker.kmsKeyId || '', provider);
-
+      const ethersWallet = new ethers.Wallet(
+        walletWithKey.privateKey,
+        provider,
+      );
       const contract = new ethers.Contract(
         process.env.NEXT_PUBLIC_NFT_CONTRACT_ADDRESS!,
         EZDRM_NFT_CONTRACT_ABI,
-        walletInstance,
+        ethersWallet,
       );
 
       // Get current nonce
-      const onchainNonce = await provider.getTransactionCount(worker.address);
-      const nonce = Math.max(worker.nonce, onchainNonce);
+      const onchainNonce = await provider.getTransactionCount(wallet.address);
+      const nonce = Math.max(wallet.nonce, onchainNonce);
 
       // Process each order in batch sequentially (for ERC-721)
       // If using ERC-1155, you could use batch minting function instead
       let currentNonce = nonce;
-      let totalGasUsed = 0n;
+      let totalGasUsed = 0;
 
       for (const orderId of orderIds) {
         try {
@@ -70,12 +79,12 @@ export class NftMintProcessor {
             orderId,
             contract,
             currentNonce,
-            walletInstance,
+            ethersWallet,
             provider,
           );
 
           if (result.success) {
-            totalGasUsed += BigInt(result.gasUsed || 0);
+            totalGasUsed += result.gasUsed || 0;
             currentNonce++;
           }
         } catch (error) {
@@ -84,8 +93,10 @@ export class NftMintProcessor {
         }
       }
 
-      // Update worker
-      this.releaseWorker(worker.id, { nonce: currentNonce });
+      // Update wallet
+      await this.walletsService.releaseWallet(wallet.id, {
+        nonce: currentNonce,
+      });
 
       this.logger.log(
         `Batch ${batchId} completed. Total gas used: ${totalGasUsed}`,
@@ -105,7 +116,7 @@ export class NftMintProcessor {
   ): Promise<{ success: boolean; gasUsed?: number }> {
     try {
       // Get order details
-      const order = await this.ordersService.findById(orderId);
+      const order = await this.ordersService.findOrderById(orderId);
       if (!order) {
         throw new Error(`Order ${orderId} not found`);
       }
@@ -122,10 +133,7 @@ export class NftMintProcessor {
         name: order.name,
         description: order.description,
         image: order.image,
-        attributes: order.attributes?.map((attr) => ({
-          trait_type: attr.trait_type,
-          value: attr.value,
-        })),
+        attributes: order.attributes,
       };
 
       // Upload metadata to IPFS
@@ -176,10 +184,14 @@ export class NftMintProcessor {
       }
 
       // Update order status
-      await this.ordersService.updateOrderStatus(orderId, order.status, {
-        transactionHash: tx.hash,
-        tokenId: tokenId ? String(tokenId) : undefined,
-      });
+      await this.ordersService.updateOrderStatus(
+        orderId,
+        OrderStatus.COMPLETED,
+        {
+          transactionHash: tx.hash,
+          tokenId: tokenId,
+        },
+      );
 
       this.logger.log(
         `Successfully minted NFT for order ${orderId}. Transaction: ${tx.hash}. Token ID: ${tokenId}`,
@@ -283,29 +295,11 @@ export class NftMintProcessor {
     }
   }
 
-  // Helper methods to simulate the missing methods from WalletsService
-  private async getWorker(): Promise<Worker> {
-    // For simplicity, create a mock worker
-    return {
-      id: 'worker-1',
-      address: '0x123456789',
-      kmsKeyId: process.env.PRIVATE_KEY || '',
-      status: 'AVAILABLE' as any,
-      nonce: 0,
-      balance: '0',
-      totalMinted: 0,
-      failedTransactions: 0,
-      successfulTransactions: 0,
-      totalGasUsed: '0',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-  }
-
-  private async releaseWorker(workerId: string, data?: any): Promise<void> {
-    // Mock implementation
-    this.logger.log(
-      `Released worker ${workerId} with data: ${JSON.stringify(data)}`,
+  @OnQueueFailed()
+  onFailed(job: Job, error: Error) {
+    this.logger.error(
+      `Job ${job.id} of type ${job.name} failed with error: ${error.message}`,
+      error.stack,
     );
   }
 }
