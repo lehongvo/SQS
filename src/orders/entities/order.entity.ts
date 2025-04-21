@@ -1,16 +1,18 @@
 import {
-  Column,
-  CreateDateColumn,
   Entity,
+  Column,
   PrimaryGeneratedColumn,
+  CreateDateColumn,
   UpdateDateColumn,
+  ManyToOne,
+  JoinColumn,
 } from 'typeorm';
 
 export enum OrderStatus {
-  PENDING = 'pending',
-  PROCESSING = 'processing',
-  COMPLETED = 'completed',
-  FAILED = 'failed',
+  PENDING = 'PENDING',
+  PROCESSING = 'PROCESSING',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
 }
 
 @Entity('orders')
@@ -18,20 +20,20 @@ export class Order {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Column({ type: 'varchar', length: 255 })
+  @Column()
   name: string;
 
-  @Column({ type: 'text' })
+  @Column({ nullable: true, type: 'text' })
   description: string;
 
-  @Column({ type: 'varchar', length: 255 })
+  @Column()
   image: string;
 
-  @Column({ type: 'varchar', length: 42 })
+  @Column()
   mintToAddress: string;
 
-  @Column({ type: 'json', nullable: true })
-  attributes: any;
+  @Column({ type: 'jsonb', nullable: true })
+  attributes: Record<string, any>;
 
   @Column({
     type: 'enum',
@@ -46,15 +48,18 @@ export class Order {
   @Column({ nullable: true })
   tokenId: string;
 
-  @Column({ nullable: true })
+  @Column({ nullable: true, type: 'text' })
   errorMessage: string;
 
   @Column({ nullable: true })
   batchId: string;
 
-  @CreateDateColumn()
+  @Column({ nullable: true })
+  workerId: string;
+
+  @CreateDateColumn({ type: 'timestamp' })
   createdAt: Date;
 
-  @UpdateDateColumn()
+  @UpdateDateColumn({ type: 'timestamp' })
   updatedAt: Date;
 }

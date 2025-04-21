@@ -1,305 +1,275 @@
-import { Processor, Process, OnQueueFailed } from '@nestjs/bull';
+import { Injectable, Inject } from '@nestjs/common';
 import { Logger } from '@nestjs/common';
-import { Job } from 'bull';
+import { ConfigService } from '@nestjs/config';
+import { OrderStatus, BatchStatus } from '@prisma/client';
 import { ethers } from 'ethers';
-import { EZDRM_NFT_CONTRACT_ABI } from '../../utils/abi';
-import { DEFAULT_GAS_LIMIT } from '../../utils/constant';
 import { OrdersService } from '../../orders/orders.service';
 import { WalletsService } from '../../wallets/wallets.service';
-import { OrderStatus } from '../../orders/entities/order.entity';
-import { MetadataInfo } from '../../utils/contract';
-import axios from 'axios';
+import { BatchProcessingService } from '../batch-processing.service';
+import { MINT_NFT_ABI } from '../../utils/abi';
+import { Worker } from '@prisma/client';
+import { JsonRpcProvider, Transaction, formatEther } from 'ethers';
 
-interface PinataResponse {
-  success: boolean;
-  urlTransactionHash: string | null;
-  message: string;
-}
-
-@Processor('nft-minting')
+@Injectable()
 export class NftMintProcessor {
   private readonly logger = new Logger(NftMintProcessor.name);
+  private readonly contract: ethers.Contract;
+  private readonly retryLimit = 3;
 
   constructor(
+    @Inject('CONTRACT_ADDRESS')
+    private readonly contractAddress: string,
+    @Inject('PROVIDER')
+    private readonly provider: ethers.JsonRpcProvider,
     private readonly ordersService: OrdersService,
     private readonly walletsService: WalletsService,
-  ) {}
-
-  @Process('process-batch')
-  async processBatch(job: Job<{ batchId: string; orderIds: string[] }>) {
-    const { batchId, orderIds } = job.data;
-    this.logger.log(
-      `Processing batch ${batchId} with ${orderIds.length} orders`,
+    private readonly batchService: BatchProcessingService,
+    private readonly configService: ConfigService,
+  ) {
+    this.contract = new ethers.Contract(
+      contractAddress,
+      MINT_NFT_ABI,
+      provider,
     );
+  }
 
+  async processOrder(orderId: string): Promise<void> {
     try {
-      // Get available wallet
-      const wallet = await this.walletsService.getAvailableWallet();
-      this.logger.log(`Using wallet ${wallet.address} for batch ${batchId}`);
-
-      // Get wallet with private key
-      const walletWithKey = await this.walletsService.getWalletWithPrivateKey(
-        wallet.id,
-      );
-
-      // Setup provider and contract
-      const provider = new ethers.JsonRpcProvider(
-        process.env.NEXT_PUBLIC_RPC_URL,
-        {
-          chainId: parseInt(
-            process.env.NEXT_PUBLIC_ALLOWED_CHAIN_ID || '2021',
-            10,
-          ),
-          name: process.env.NEXT_PUBLIC_NAME_OF_CHAIN || 'saigon',
-        },
-      );
-
-      const ethersWallet = new ethers.Wallet(
-        walletWithKey.privateKey,
-        provider,
-      );
-      const contract = new ethers.Contract(
-        process.env.NEXT_PUBLIC_NFT_CONTRACT_ADDRESS!,
-        EZDRM_NFT_CONTRACT_ABI,
-        ethersWallet,
-      );
-
-      // Get current nonce
-      const onchainNonce = await provider.getTransactionCount(wallet.address);
-      const nonce = Math.max(wallet.nonce, onchainNonce);
-
-      // Process each order in batch sequentially (for ERC-721)
-      // If using ERC-1155, you could use batch minting function instead
-      let currentNonce = nonce;
-      let totalGasUsed = 0;
-
-      for (const orderId of orderIds) {
-        try {
-          const result = await this.processIndividualOrder(
-            orderId,
-            contract,
-            currentNonce,
-            ethersWallet,
-            provider,
-          );
-
-          if (result.success) {
-            totalGasUsed += result.gasUsed || 0;
-            currentNonce++;
-          }
-        } catch (error) {
-          this.logger.error(`Error processing order ${orderId}`, error);
-          // Continue with next order
-        }
+      // Get order details
+      const order = await this.ordersService.getOrderById(orderId);
+      if (order.status !== OrderStatus.PENDING) {
+        this.logger.warn(
+          `Order ${orderId} is not in PENDING status. Current status: ${order.status}`,
+        );
+        return;
       }
 
-      // Update wallet
-      await this.walletsService.releaseWallet(wallet.id, {
-        nonce: currentNonce,
-      });
-
+      // Get an available worker
+      const worker = await this.walletsService.getAvailableWorker();
       this.logger.log(
-        `Batch ${batchId} completed. Total gas used: ${totalGasUsed}`,
+        `Using worker ${worker.id} (${worker.address}) to process order ${orderId}`,
       );
+
+      // Assign worker to order
+      await this.ordersService.assignWorkerToOrder(orderId, worker.id);
+
+      try {
+        // Get worker's current nonce
+        const nonce = await this.provider.getTransactionCount(worker.address);
+
+        // Check if nonce from blockchain is different from stored nonce
+        if (nonce !== worker.nonce) {
+          this.logger.warn(
+            `Worker ${worker.id} nonce discrepancy: stored=${worker.nonce}, onchain=${nonce}. Using onchain value.`,
+          );
+        }
+
+        // Prepare mint transaction data
+        const mintToAddress = order.mintToAddress;
+        const tokenURI = `ipfs://${order.image}`;
+        const name = order.name;
+        const description = order.description || '';
+        const attributes = order.attributes
+          ? JSON.stringify(order.attributes)
+          : '{}';
+
+        // Encode function data for mintTo function
+        const mintToData = this.contract.interface.encodeFunctionData(
+          'mintTo',
+          [mintToAddress, tokenURI, name, description, attributes],
+        );
+
+        // Get gas price with buffer
+        const gasPrice = await this.provider.getFeeData();
+        const maxFeePerGas = gasPrice.maxFeePerGas
+          ? (gasPrice.maxFeePerGas * BigInt(12)) / BigInt(10) // Add 20% buffer
+          : undefined;
+        const maxPriorityFeePerGas = gasPrice.maxPriorityFeePerGas
+          ? (gasPrice.maxPriorityFeePerGas * BigInt(12)) / BigInt(10) // Add 20% buffer
+          : undefined;
+
+        // Estimate gas
+        const gasLimit = await this.contract
+          .getFunction('mintTo')
+          .estimateGas(mintToAddress, tokenURI, name, description, attributes, {
+            from: worker.address,
+          });
+
+        // Add 20% buffer to gas limit
+        const gasLimitWithBuffer = (gasLimit * BigInt(12)) / BigInt(10);
+
+        const network = await this.provider.getNetwork();
+        // Create transaction object
+        const tx = {
+          to: this.contractAddress,
+          data: mintToData,
+          nonce,
+          chainId: network.chainId,
+          maxFeePerGas,
+          maxPriorityFeePerGas,
+          gasLimit: gasLimitWithBuffer,
+          type: 2, // EIP-1559 transaction
+        };
+
+        // Sign transaction with worker wallet
+        const signedTx = await this.walletsService.signTransaction(
+          worker,
+          Transaction.from(tx).serialized,
+        );
+
+        // Send transaction
+        const txResponse = await this.provider.broadcastTransaction(signedTx);
+        this.logger.log(
+          `Transaction sent: ${txResponse.hash} for order ${orderId}`,
+        );
+
+        // Wait for transaction confirmation
+        const receipt = await txResponse.wait();
+        this.logger.log(
+          `Transaction confirmed: ${receipt?.hash} for order ${orderId}`,
+        );
+
+        await this.processTransaction(receipt, orderId, worker);
+      } catch (error) {
+        // Handle error and mark order as failed
+        this.logger.error(
+          `Error processing order ${orderId}: ${error.message}`,
+          error.stack,
+        );
+
+        // Mark order as failed
+        await this.ordersService.failOrder(orderId, error.message);
+
+        // Update worker stats for failed transaction
+        await this.walletsService.trackFailedMint(worker.id);
+
+        // Update batch stats if this order is part of a batch
+        if (order.batchId) {
+          await this.batchService.incrementFailedOrders(order.batchId);
+        }
+
+        // Release worker
+        await this.walletsService.releaseWorker(worker.id);
+
+        throw error;
+      }
     } catch (error) {
-      this.logger.error(`Error processing batch ${batchId}`, error);
+      this.logger.error(
+        `Failed to process order ${orderId}: ${error.message}`,
+        error.stack,
+      );
       throw error;
     }
   }
 
-  private async processIndividualOrder(
-    orderId: string,
-    contract: ethers.Contract,
-    nonce: number,
-    wallet: ethers.Wallet,
-    provider: ethers.JsonRpcProvider,
-  ): Promise<{ success: boolean; gasUsed?: number }> {
+  async processBatch(batchId: string): Promise<void> {
+    this.logger.log(`Processing batch ${batchId}`);
+
     try {
-      // Get order details
-      const order = await this.ordersService.findOrderById(orderId);
-      if (!order) {
-        throw new Error(`Order ${orderId} not found`);
-      }
+      // Get batch details
+      const batch = await this.ordersService.getBatchById(batchId);
 
-      if (order.status !== OrderStatus.PROCESSING) {
-        this.logger.log(
-          `Order ${orderId} is not in PROCESSING state, skipping`,
-        );
-        return { success: false };
-      }
+      // Get pending orders for this batch
+      const pendingOrders =
+        await this.ordersService.getOrdersByBatchId(batchId);
 
-      // Prepare metadata
-      const metadataInfo: MetadataInfo = {
-        name: order.name,
-        description: order.description,
-        image: order.image,
-        attributes: order.attributes,
-      };
-
-      // Upload metadata to IPFS
-      const metadata = await this.uploadToIPFS(metadataInfo);
-      if (!metadata.success || !metadata.urlTransactionHash) {
-        throw new Error(
-          `Failed to upload metadata to IPFS: ${metadata.message}`,
-        );
-      }
-
-      // Get current gas prices
-      const feeData = await provider.getFeeData();
-      if (!feeData.maxFeePerGas || !feeData.maxPriorityFeePerGas) {
-        throw new Error('Could not get fee data');
-      }
-
-      // Mint NFT
-      const tx = await contract.safeMint(
-        order.mintToAddress,
-        metadata.urlTransactionHash,
-        {
-          gasLimit: DEFAULT_GAS_LIMIT,
-          maxFeePerGas: feeData.maxFeePerGas,
-          maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
-          nonce: nonce,
-        },
-      );
-
-      // Wait for transaction
-      const receipt = await tx.wait();
-
-      // Extract token ID from logs
-      let tokenId = null;
-      for (const log of receipt.logs) {
-        try {
-          const parsedLog = contract.interface.parseLog({
-            topics: log.topics,
-            data: log.data,
-          });
-
-          if (parsedLog && parsedLog.name === 'Transfer') {
-            tokenId = parsedLog.args[2].toString();
-            break;
-          }
-        } catch (error) {
-          continue;
-        }
-      }
-
-      // Update order status
-      await this.ordersService.updateOrderStatus(
-        orderId,
-        OrderStatus.COMPLETED,
-        {
-          transactionHash: tx.hash,
-          tokenId: tokenId,
-        },
+      // Update batch status to PROCESSING
+      await this.ordersService.updateBatchStatus(
+        batchId,
+        BatchStatus.PROCESSING,
       );
 
       this.logger.log(
-        `Successfully minted NFT for order ${orderId}. Transaction: ${tx.hash}. Token ID: ${tokenId}`,
+        `Starting to process ${pendingOrders.length} orders from batch ${batchId}`,
       );
 
-      return {
-        success: true,
-        gasUsed: Number(receipt.gasUsed || 0),
-      };
+      // Process each order
+      let completedCount = 0;
+      let failedCount = 0;
+
+      for (const order of pendingOrders.filter(
+        (o) => o.status === OrderStatus.PENDING,
+      )) {
+        try {
+          await this.processOrder(order.id);
+          completedCount++;
+        } catch (error) {
+          failedCount++;
+          this.logger.error(
+            `Failed to process order ${order.id} in batch ${batchId}: ${error.message}`,
+            error.stack,
+          );
+        }
+
+        // Wait a short time between orders to avoid blockchain rate limiting
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+
+      // Update batch completion status
+      const allOrders = await this.ordersService.getOrdersByBatchId(batchId);
+      const remainingPending = allOrders.filter(
+        (o) => o.status === OrderStatus.PENDING,
+      ).length;
+
+      if (remainingPending === 0) {
+        const isCompleted = allOrders.every(
+          (o) => o.status === OrderStatus.COMPLETED,
+        );
+
+        if (isCompleted) {
+          await this.ordersService.updateBatchStatus(
+            batchId,
+            BatchStatus.COMPLETED,
+          );
+          this.logger.log(`Batch ${batchId} completed successfully`);
+        } else {
+          await this.ordersService.updateBatchStatus(
+            batchId,
+            BatchStatus.FAILED,
+          );
+          this.logger.warn(`Batch ${batchId} completed with some failures`);
+        }
+      }
     } catch (error) {
-      this.logger.error(`Error processing order ${orderId}`, error);
-
-      // Update order status to FAILED
-      await this.ordersService.updateOrderStatus(orderId, OrderStatus.FAILED, {
-        errorMessage: error.message || 'Unknown error',
-      });
-
-      return { success: false };
+      this.logger.error(
+        `Error processing batch ${batchId}: ${error.message}`,
+        error.stack,
+      );
+      await this.ordersService
+        .updateBatchStatus(batchId, BatchStatus.FAILED)
+        .catch(() => {});
+      throw error;
     }
   }
 
-  private async uploadToIPFS(
-    metadataInfo: MetadataInfo,
-  ): Promise<PinataResponse> {
-    try {
-      // Validate environment variables
-      const url = process.env.PINATA_URL;
-      const JWT = process.env.PINATA_JWT;
-      const PINATA_API_KEY = process.env.PINATA_API_KEY;
-      const PINATA_SECRET_API_KEY = process.env.PINATA_SECRET_API_KEY;
-      const PINATA_CLOUD_URL = process.env.PINATA_CLOUD_URL;
-
-      if (
-        !url ||
-        !JWT ||
-        !PINATA_API_KEY ||
-        !PINATA_SECRET_API_KEY ||
-        !PINATA_CLOUD_URL
-      ) {
-        console.error('Missing Pinata configuration');
-        return {
-          success: false,
-          urlTransactionHash: null,
-          message: 'Missing Pinata configuration in environment variables',
-        };
-      }
-
-      // Create form data
-      const form = new FormData();
-      const metadataBlob = new Blob([JSON.stringify(metadataInfo)], {
-        type: 'application/json',
-      });
-      form.append('file', metadataBlob, 'metadata.json');
-
-      // Add pinata options - simplified for speed
-      const pinataOptions = JSON.stringify({
-        cidVersion: 1,
-      });
-      form.append('pinataOptions', pinataOptions);
-
-      // Upload to Pinata
-      const response = await axios.post(url, form, {
-        maxBodyLength: Infinity,
-        timeout: 5000,
-        headers: {
-          'Content-Type': `multipart/form-data`,
-          Authorization: `Bearer ${JWT}`,
-          pinata_api_key: PINATA_API_KEY,
-          pinata_secret_api_key: PINATA_SECRET_API_KEY,
-        },
-      });
-
-      if (!response.data.IpfsHash) {
-        console.error('Pinata response missing IpfsHash:', response.data);
-        return {
-          success: false,
-          urlTransactionHash: null,
-          message: 'Failed to get IPFS hash from Pinata',
-        };
-      }
-
-      const ipfsUrl = `${PINATA_CLOUD_URL}${response.data.IpfsHash}`;
-      return {
-        success: true,
-        urlTransactionHash: ipfsUrl,
-        message: 'Metadata pinned successfully to IPFS',
-      };
-    } catch (error: any) {
-      console.error('Error when uploading to Pinata:', {
-        message: error.message,
-        response: error.response?.data,
-      });
-      return {
-        success: false,
-        urlTransactionHash: null,
-        message:
-          error.response?.data?.error?.details ||
-          error.message ||
-          'Error uploading to Pinata',
-      };
+  async processTransaction(
+    receipt: ethers.TransactionReceipt | null,
+    orderId: string,
+    worker: Worker,
+  ) {
+    if (!receipt) {
+      throw new Error('Transaction receipt is null');
     }
-  }
 
-  @OnQueueFailed()
-  onFailed(job: Job, error: Error) {
-    this.logger.error(
-      `Job ${job.id} of type ${job.name} failed with error: ${error.message}`,
-      error.stack,
+    const mintLog = receipt.logs.find(
+      (log) => log.address.toLowerCase() === this.contractAddress.toLowerCase(),
+    );
+
+    if (!mintLog) {
+      throw new Error('Mint log not found in transaction receipt');
+    }
+
+    const parsedLog = this.contract.interface.parseLog(mintLog);
+    const tokenId = parsedLog?.args[0].toString();
+
+    if (!tokenId) {
+      throw new Error('Failed to parse token ID from mint log');
+    }
+
+    await this.ordersService.completeOrder(orderId, receipt.hash, tokenId);
+    await this.walletsService.trackSuccessfulMint(
+      worker.id,
+      receipt.gasUsed.toString(),
     );
   }
 }

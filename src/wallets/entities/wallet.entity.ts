@@ -51,3 +51,52 @@ export class Wallet {
   @UpdateDateColumn()
   updatedAt: Date;
 }
+
+export enum WorkerStatus {
+  AVAILABLE = 'AVAILABLE',
+  BUSY = 'BUSY',
+  DISABLED = 'DISABLED',
+}
+
+@Entity('workers')
+export class Worker {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column()
+  address: string;
+
+  @Column()
+  keyReference: string;
+
+  @Column({
+    type: 'enum',
+    enum: WorkerStatus,
+    default: WorkerStatus.AVAILABLE,
+  })
+  status: WorkerStatus;
+
+  @Column({ default: 0 })
+  nonce: number;
+
+  @Column({ default: '0' })
+  balance: string;
+
+  @Column({ default: 0 })
+  totalMinted: number;
+
+  @Column({ default: 0 })
+  failedTransactions: number;
+
+  @Column({ default: 0 })
+  successfulTransactions: number;
+
+  @Column({ default: '0' })
+  totalGasUsed: string;
+
+  @CreateDateColumn({ type: 'timestamp' })
+  createdAt: Date;
+
+  @UpdateDateColumn({ type: 'timestamp' })
+  updatedAt: Date;
+}

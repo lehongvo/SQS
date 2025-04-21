@@ -1,42 +1,21 @@
-import {
-  IsString,
-  IsNotEmpty,
-  IsOptional,
-  IsArray,
-  ValidateNested,
-  IsNumber,
-} from 'class-validator';
-import { Type } from 'class-transformer';
-
-class AttributeDto {
-  @IsString()
-  @IsNotEmpty()
-  trait_type: string;
-
-  @IsNotEmpty()
-  value: string | number;
-}
+import { IsString, IsOptional, IsObject } from 'class-validator';
+import { Prisma } from '@prisma/client';
 
 export class MintNftDto {
   @IsString()
-  @IsNotEmpty()
+  mintToAddress: string;
+
+  @IsString()
   name: string;
 
   @IsString()
-  @IsNotEmpty()
-  description: string;
+  @IsOptional()
+  description?: string;
 
   @IsString()
-  @IsNotEmpty()
   image: string;
 
-  @IsString()
-  @IsNotEmpty()
-  mintToAddress: string;
-
+  @IsObject()
   @IsOptional()
-  @IsArray()
-  @ValidateNested({ each: true })
-  @Type(() => AttributeDto)
-  attributes?: AttributeDto[];
+  attributes?: Prisma.JsonObject;
 }

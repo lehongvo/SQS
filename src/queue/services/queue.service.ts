@@ -1,72 +1,97 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import {
-  SQSClient,
-  SendMessageCommand,
-  ReceiveMessageCommand,
-  DeleteMessageCommand,
-} from '@aws-sdk/client-sqs';
+import { InjectQueue } from '@nestjs/bull';
+import { Queue } from 'bull';
 
 @Injectable()
 export class QueueService {
   private readonly logger = new Logger(QueueService.name);
 
-  constructor(
-    private readonly sqsClient: SQSClient,
-    private readonly configService: ConfigService,
-  ) {}
+  constructor(@InjectQueue('nft-mint') private readonly nftMintQueue: Queue) {}
 
-  async sendToQueue(message: any): Promise<string> {
+  async addMintJob(data: any): Promise<string> {
     try {
-      const queueUrl = this.configService.get<string>('SQS_QUEUE_URL');
-      const command = new SendMessageCommand({
-        QueueUrl: queueUrl,
-        MessageBody: JSON.stringify(message),
-        MessageAttributes: {
-          Type: {
-            DataType: 'String',
-            StringValue: 'NFT_MINT',
-          },
+      const job = await this.nftMintQueue.add('mint-nft', data, {
+        attempts: 3,
+        backoff: {
+          type: 'exponential',
+          delay: 5000,
         },
+        removeOnComplete: true,
+        timeout: 180000, // 3 minutes timeout
       });
 
-      const result = await this.sqsClient.send(command);
-      return result.MessageId!;
+      this.logger.log(`Added NFT mint job ${job.id} to queue`);
+      return job.id.toString();
     } catch (error) {
-      this.logger.error('Error sending message to queue', error);
+      this.logger.error(
+        `Error adding mint job to queue: ${error.message}`,
+        error.stack,
+      );
       throw error;
     }
   }
 
-  async receiveMessages(maxMessages: number = 10): Promise<any[]> {
+  async addBatchJob(batchId: string, priority = 10): Promise<string> {
     try {
-      const queueUrl = this.configService.get<string>('SQS_QUEUE_URL');
-      const command = new ReceiveMessageCommand({
-        QueueUrl: queueUrl,
-        MaxNumberOfMessages: maxMessages,
-        WaitTimeSeconds: 20,
-        MessageAttributeNames: ['All'],
-      });
+      const job = await this.nftMintQueue.add(
+        'process-batch',
+        { batchId },
+        {
+          attempts: 2,
+          priority,
+          backoff: {
+            type: 'exponential',
+            delay: 10000,
+          },
+          removeOnComplete: true,
+          timeout: 600000, // 10 minutes timeout for batch processing
+        },
+      );
 
-      const result = await this.sqsClient.send(command);
-      return result.Messages || [];
+      this.logger.log(
+        `Added batch processing job ${job.id} for batch ${batchId} to queue`,
+      );
+      return job.id.toString();
     } catch (error) {
-      this.logger.error('Error receiving messages from queue', error);
+      this.logger.error(
+        `Error adding batch job to queue: ${error.message}`,
+        error.stack,
+      );
       throw error;
     }
   }
 
-  async deleteMessage(receiptHandle: string): Promise<void> {
+  async getQueueStatus(): Promise<any> {
     try {
-      const queueUrl = this.configService.get<string>('SQS_QUEUE_URL');
-      const command = new DeleteMessageCommand({
-        QueueUrl: queueUrl,
-        ReceiptHandle: receiptHandle,
-      });
+      const [waiting, active, completed, failed] = await Promise.all([
+        this.nftMintQueue.getWaitingCount(),
+        this.nftMintQueue.getActiveCount(),
+        this.nftMintQueue.getCompletedCount(),
+        this.nftMintQueue.getFailedCount(),
+      ]);
 
-      await this.sqsClient.send(command);
+      return {
+        waiting,
+        active,
+        completed,
+        failed,
+        total: waiting + active + completed + failed,
+      };
     } catch (error) {
-      this.logger.error('Error deleting message from queue', error);
+      this.logger.error(
+        `Error getting queue status: ${error.message}`,
+        error.stack,
+      );
+      throw error;
+    }
+  }
+
+  async clearQueue(): Promise<void> {
+    try {
+      await this.nftMintQueue.empty();
+      this.logger.log('Queue cleared successfully');
+    } catch (error) {
+      this.logger.error(`Error clearing queue: ${error.message}`, error.stack);
       throw error;
     }
   }

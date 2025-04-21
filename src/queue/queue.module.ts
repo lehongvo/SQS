@@ -1,11 +1,30 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { BullModule } from '@nestjs/bull';
 import { QueueService } from './services/queue.service';
-import { awsConfig } from '../config/aws.config';
+import { BatchProcessingModule } from '../batch-processing/batch-processing.module';
+import { NftMintQueueProcessor } from './processors/nft-mint.processor';
 
 @Module({
-  imports: [ConfigModule, awsConfig],
-  providers: [QueueService],
-  exports: [QueueService],
+  imports: [
+    ConfigModule,
+    BullModule.forRootAsync({
+      imports: [ConfigModule],
+      useFactory: (configService: ConfigService) => ({
+        redis: {
+          host: configService.get('REDIS_HOST', 'localhost'),
+          port: parseInt(configService.get('REDIS_PORT', '6379')),
+          password: configService.get('REDIS_PASSWORD', ''),
+        },
+      }),
+      inject: [ConfigService],
+    }),
+    BullModule.registerQueue({
+      name: 'nft-mint',
+    }),
+    BatchProcessingModule,
+  ],
+  providers: [QueueService, NftMintQueueProcessor],
+  exports: [QueueService, BullModule],
 })
 export class QueueModule {}

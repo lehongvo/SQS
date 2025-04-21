@@ -1,0 +1,11 @@
+dist
+node_modules
+.serverless
+.build
+coverage
+.vscode
+.idea
+.git
+*.log
+*.map
+*.md

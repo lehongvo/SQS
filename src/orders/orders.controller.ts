@@ -9,6 +9,7 @@ import {
   Query,
   BadRequestException,
   Logger,
+  Param,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
@@ -25,16 +26,22 @@ import {
 export class OrdersController {
   private readonly logger = new Logger(OrdersController.name);
   private readonly sqsClient: SQSClient;
-  private readonly queueUrl: string;
 
   constructor(
     private readonly ordersService: OrdersService,
     private readonly configService: ConfigService,
   ) {
+    const region = this.configService.get<string>('AWS_REGION');
     this.sqsClient = new SQSClient({
-      region: this.configService.get('REGION', 'ap-southeast-1'),
+      region,
+      credentials: {
+        accessKeyId: this.configService.get<string>('AWS_ACCESS_KEY_ID', ''),
+        secretAccessKey: this.configService.get<string>(
+          'AWS_SECRET_ACCESS_KEY',
+          '',
+        ),
+      },
     });
-    this.queueUrl = this.configService.get('NFT_MINT_QUEUE_URL', '');
   }
 
   @Post()
@@ -42,135 +49,86 @@ export class OrdersController {
   @UseGuards(ApiKeyGuard)
   async createOrder(@Body() mintNftDto: MintNftDto) {
     try {
-      // Create the order in DynamoDB
-      const orderRequest: OrderRequest = {
-        name: mintNftDto.name,
-        description: mintNftDto.description,
-        image: mintNftDto.image,
+      // Create order in database
+      const order = await this.ordersService.create({
         mintToAddress: mintNftDto.mintToAddress,
+        name: mintNftDto.name,
+        description: mintNftDto.description || '',
+        image: mintNftDto.image,
         attributes: mintNftDto.attributes,
-      };
-
-      const order = await this.ordersService.create(orderRequest);
+        status: 'PENDING',
+      });
 
       // Send message to SQS for processing
       await this.sqsClient.send(
         new SendMessageCommand({
-          QueueUrl: this.queueUrl,
+          QueueUrl: this.configService.get<string>('SQS_QUEUE_URL'),
           MessageBody: JSON.stringify({
             orderId: order.id,
-            type: 'SINGLE_ORDER',
+            type: 'MINT_NFT',
           }),
         }),
       );
 
       return {
         success: true,
-        data: {
-          orderId: order.id,
-          status: order.status,
-        },
-        message: 'Order created successfully and queued for processing',
+        orderId: order.id,
+        status: order.status,
       };
     } catch (error) {
-      this.logger.error(`Error creating order: ${error.message}`, error.stack);
-      throw new BadRequestException(`Failed to create order: ${error.message}`);
+      this.logger.error('Error creating order:', error);
+      throw error;
     }
   }
 
   @Post('batch')
   @HttpCode(HttpStatus.CREATED)
   @UseGuards(ApiKeyGuard)
-  async createBatchOrders(@Body() batchRequest: OrderBatchRequest) {
+  async createBatchOrders(@Body() orders: MintNftDto[]) {
     try {
-      if (!batchRequest.orders || batchRequest.orders.length === 0) {
-        throw new BadRequestException(
-          'Batch request must contain at least one order',
-        );
-      }
+      const orderData = orders.map((order) => ({
+        mintToAddress: order.mintToAddress,
+        name: order.name,
+        description: order.description || '',
+        image: order.image,
+        attributes: order.attributes || {},
+        status: OrderStatus.PENDING,
+      }));
 
-      if (batchRequest.orders.length > 100) {
-        throw new BadRequestException('Batch request cannot exceed 100 orders');
-      }
-
-      // Create all orders in DynamoDB
-      const orderIds = await this.ordersService.batchCreate(
-        batchRequest.orders,
-      );
-
-      // Send batch message to SQS for processing
-      await this.sqsClient.send(
-        new SendMessageCommand({
-          QueueUrl: this.queueUrl,
-          MessageBody: JSON.stringify({
-            orderIds,
-            type: 'BATCH_ORDER',
-          }),
-        }),
-      );
+      const count = await this.ordersService.batchCreate(orderData);
 
       return {
         success: true,
-        data: {
-          orderIds,
-          count: orderIds.length,
-        },
-        message: 'Batch orders created successfully and queued for processing',
+        count,
+        message: `Created ${count} orders successfully`,
       };
     } catch (error) {
-      this.logger.error(
-        `Error creating batch orders: ${error.message}`,
-        error.stack,
-      );
-      throw new BadRequestException(
-        `Failed to create batch orders: ${error.message}`,
-      );
+      this.logger.error('Error creating batch orders:', error);
+      throw error;
+    }
+  }
+
+  @Get(':id')
+  @UseGuards(ApiKeyGuard)
+  async getOrder(@Param('id') id: string) {
+    try {
+      const order = await this.ordersService.findById(id);
+      return order;
+    } catch (error) {
+      this.logger.error(`Error getting order ${id}:`, error);
+      throw error;
     }
   }
 
   @Get()
   @UseGuards(ApiKeyGuard)
-  async getOrder(@Query('id') id: string) {
-    try {
-      if (!id) {
-        throw new BadRequestException('Order ID is required');
-      }
-
-      const order = await this.ordersService.findById(id);
-
-      if (!order) {
-        throw new BadRequestException(`Order with ID ${id} not found`);
-      }
-
-      return {
-        success: true,
-        data: order,
-      };
-    } catch (error) {
-      this.logger.error(`Error getting order: ${error.message}`, error.stack);
-      throw new BadRequestException(`Failed to get order: ${error.message}`);
-    }
-  }
-
-  @Get('pending')
-  @UseGuards(ApiKeyGuard)
-  async getPendingOrders(@Query('limit') limit: number = 100) {
+  async getPendingOrders(@Query('limit') limit: number = 10) {
     try {
       const orders = await this.ordersService.findPendingOrders(limit);
-
-      return {
-        success: true,
-        data: orders,
-        count: orders.length,
-      };
+      return orders;
     } catch (error) {
-      this.logger.error(
-        `Error getting pending orders: ${error.message}`,
-        error.stack,
-      );
-      throw new BadRequestException(
-        `Failed to get pending orders: ${error.message}`,
-      );
+      this.logger.error('Error getting pending orders:', error);
+      throw error;
     }
   }
 }
