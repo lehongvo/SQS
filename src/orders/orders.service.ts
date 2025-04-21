@@ -93,7 +93,7 @@ export class OrdersService {
   }
 
   async createBatchOrder(batchId: string, orderData: Prisma.OrderCreateInput) {
-    const { worker, batch, ...orderDataWithoutRelations } = orderData;
+    const { account, batch, ...orderDataWithoutRelations } = orderData;
 
     return this.prisma.order.create({
       data: {
@@ -109,11 +109,11 @@ export class OrdersService {
     });
   }
 
-  async assignWorkerToOrder(orderId: string, workerId: string) {
+  async assignAccountToOrder(orderId: string, accountId: string) {
     return this.prisma.order.update({
       where: { id: orderId },
       data: {
-        workerId,
+        accountId,
         status: OrderStatus.PROCESSING,
       },
     });
@@ -191,7 +191,12 @@ export class OrdersService {
   async updateBatchStatus(batchId: string, status: BatchStatus) {
     return this.prisma.batch.update({
       where: { id: batchId },
-      data: { status },
+      data: {
+        status,
+        ...(status === BatchStatus.COMPLETED
+          ? { completedAt: new Date() }
+          : {}),
+      },
     });
   }
 }

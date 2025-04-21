@@ -12,7 +12,6 @@ import {
   Param,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import { ApiKeyGuard } from '../guards/api-key.guard';
 import { OrdersService } from './orders.service';
 import { MintNftDto } from '../nft/dto/mint-nft.dto';
@@ -25,24 +24,11 @@ import {
 @Controller('orders')
 export class OrdersController {
   private readonly logger = new Logger(OrdersController.name);
-  private readonly sqsClient: SQSClient;
 
   constructor(
     private readonly ordersService: OrdersService,
     private readonly configService: ConfigService,
-  ) {
-    const region = this.configService.get<string>('AWS_REGION');
-    this.sqsClient = new SQSClient({
-      region,
-      credentials: {
-        accessKeyId: this.configService.get<string>('AWS_ACCESS_KEY_ID', ''),
-        secretAccessKey: this.configService.get<string>(
-          'AWS_SECRET_ACCESS_KEY',
-          '',
-        ),
-      },
-    });
-  }
+  ) {}
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
@@ -58,17 +44,6 @@ export class OrdersController {
         attributes: mintNftDto.attributes,
         status: 'PENDING',
       });
-
-      // Send message to SQS for processing
-      await this.sqsClient.send(
-        new SendMessageCommand({
-          QueueUrl: this.configService.get<string>('SQS_QUEUE_URL'),
-          MessageBody: JSON.stringify({
-            orderId: order.id,
-            type: 'MINT_NFT',
-          }),
-        }),
-      );
 
       return {
         success: true,

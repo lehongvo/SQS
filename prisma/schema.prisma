@@ -15,7 +15,9 @@ datasource db {
 
 enum OrderStatus {
   PENDING
+  PENDING_FUND
   PROCESSING
+  RETRY
   COMPLETED
   FAILED
 }
@@ -27,10 +29,10 @@ enum BatchStatus {
   FAILED
 }
 
-enum WorkerStatus {
+enum AccountStatus {
   AVAILABLE
   BUSY
-  OFFLINE
+  DISABLED
 }
 
 model Order {
@@ -44,13 +46,13 @@ model Order {
   transactionHash String?
   tokenId         String?
   errorMessage    String?
-  workerId        String?
+  accountId       String?
   batchId         String?
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
 
-  batch  Batch?  @relation(fields: [batchId], references: [id])
-  worker Worker? @relation(fields: [workerId], references: [id])
+  batch   Batch?   @relation(fields: [batchId], references: [id])
+  account Account? @relation(fields: [accountId], references: [id])
 }
 
 model Batch {
@@ -66,20 +68,20 @@ model Batch {
   orders Order[]
 }
 
-model Worker {
-  id                     String       @id @default(uuid())
-  address                String       @unique
+model Account {
+  id                     String        @id @default(uuid())
+  address                String        @unique
   keyReference           String
-  status                 WorkerStatus @default(AVAILABLE)
-  nonce                  Int          @default(0)
-  balance                String       @default("0")
-  totalMinted            Int          @default(0)
-  failedTransactions     Int          @default(0)
-  successfulTransactions Int          @default(0)
-  totalGasUsed           String       @default("0")
+  status                 AccountStatus @default(AVAILABLE)
+  nonce                  Int           @default(0)
+  balance                String        @default("0")
+  totalMinted            Int           @default(0)
+  failedTransactions     Int           @default(0)
+  successfulTransactions Int           @default(0)
+  totalGasUsed           String        @default("0")
   lastUsed               DateTime?
-  createdAt              DateTime     @default(now())
-  updatedAt              DateTime     @updatedAt
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
 
   orders Order[]
 }

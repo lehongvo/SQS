@@ -1,14 +1,16 @@
 import { Injectable, Inject } from '@nestjs/common';
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { OrderStatus, BatchStatus } from '@prisma/client';
+import { OrderStatus, BatchStatus, Account } from '@prisma/client';
 import { ethers } from 'ethers';
 import { OrdersService } from '../../orders/orders.service';
 import { WalletsService } from '../../wallets/wallets.service';
 import { BatchProcessingService } from '../batch-processing.service';
 import { MINT_NFT_ABI } from '../../utils/abi';
-import { Worker } from '@prisma/client';
-import { JsonRpcProvider, Transaction, formatEther } from 'ethers';
+import { JsonRpcProvider, Transaction, formatEther, parseEther } from 'ethers';
+import { RetryService } from '../../queue/services/retry.service';
+import { AccountsService } from '../../accounts/accounts.service';
+import { FundService } from '../../fund/services/fund.service';
 
 @Injectable()
 export class NftMintProcessor {
@@ -25,6 +27,9 @@ export class NftMintProcessor {
     private readonly walletsService: WalletsService,
     private readonly batchService: BatchProcessingService,
     private readonly configService: ConfigService,
+    private readonly retryService: RetryService,
+    private readonly accountsService: AccountsService,
+    private readonly fundService: FundService,
   ) {
     this.contract = new ethers.Contract(
       contractAddress,
@@ -37,6 +42,16 @@ export class NftMintProcessor {
     try {
       // Get order details
       const order = await this.ordersService.getOrderById(orderId);
+
+      // Check for orders waiting for funding (using errorMessage as temporary solution)
+      if (
+        order.status === OrderStatus.PENDING &&
+        order.errorMessage?.includes('Waiting for account funding')
+      ) {
+        this.logger.log(`Order ${orderId} is waiting for funding to complete.`);
+        return;
+      }
+
       if (order.status !== OrderStatus.PENDING) {
         this.logger.warn(
           `Order ${orderId} is not in PENDING status. Current status: ${order.status}`,
@@ -44,23 +59,23 @@ export class NftMintProcessor {
         return;
       }
 
-      // Get an available worker
-      const worker = await this.walletsService.getAvailableWorker();
+      // Get an available account
+      const account = await this.accountsService.getAvailableAccount();
       this.logger.log(
-        `Using worker ${worker.id} (${worker.address}) to process order ${orderId}`,
+        `Using account ${account.id} (${account.address}) to process order ${orderId}`,
       );
 
-      // Assign worker to order
-      await this.ordersService.assignWorkerToOrder(orderId, worker.id);
+      // Assign account to order
+      await this.ordersService.assignAccountToOrder(orderId, account.id);
 
       try {
         // Get worker's current nonce
-        const nonce = await this.provider.getTransactionCount(worker.address);
+        const nonce = await this.provider.getTransactionCount(account.address);
 
         // Check if nonce from blockchain is different from stored nonce
-        if (nonce !== worker.nonce) {
+        if (nonce !== account.nonce) {
           this.logger.warn(
-            `Worker ${worker.id} nonce discrepancy: stored=${worker.nonce}, onchain=${nonce}. Using onchain value.`,
+            `Account ${account.id} nonce discrepancy: stored=${account.nonce}, onchain=${nonce}. Using onchain value.`,
           );
         }
 
@@ -92,11 +107,45 @@ export class NftMintProcessor {
         const gasLimit = await this.contract
           .getFunction('mintTo')
           .estimateGas(mintToAddress, tokenURI, name, description, attributes, {
-            from: worker.address,
+            from: account.address,
           });
 
         // Add 20% buffer to gas limit
         const gasLimitWithBuffer = (gasLimit * BigInt(12)) / BigInt(10);
+
+        // Calculate total gas cost estimation
+        const gasCost =
+          gasLimitWithBuffer *
+          (maxFeePerGas || gasPrice.gasPrice || parseEther('0.000000001'));
+
+        // Check account balance
+        const accountBalance = await this.provider.getBalance(account.address);
+
+        // If balance is less than required gas cost plus buffer
+        const requiredBalance = gasCost + parseEther('0.01'); // Add 0.01 ETH as buffer
+
+        if (accountBalance < requiredBalance) {
+          this.logger.warn(
+            `Account ${account.id} has insufficient balance: ${formatEther(accountBalance)} ETH, ` +
+              `needed ~${formatEther(requiredBalance)} ETH`,
+          );
+
+          // Release the account first
+          await this.accountsService.releaseAccount(account.id);
+
+          // Add fund request to queue
+          await this.fundService.addFundRequest(
+            orderId,
+            account.id,
+            requiredBalance.toString(),
+          );
+
+          this.logger.log(
+            `Added fund request for account ${account.id} (order: ${orderId}). ` +
+              `Order waiting for funding.`,
+          );
+          return;
+        }
 
         const network = await this.provider.getNetwork();
         // Create transaction object
@@ -111,9 +160,15 @@ export class NftMintProcessor {
           type: 2, // EIP-1559 transaction
         };
 
-        // Sign transaction with worker wallet
+        // Update order status to PROCESSING
+        await this.ordersService.updateOrderStatus(
+          orderId,
+          OrderStatus.PROCESSING,
+        );
+
+        // Sign transaction with account wallet
         const signedTx = await this.walletsService.signTransaction(
-          worker,
+          account,
           Transaction.from(tx).serialized,
         );
 
@@ -129,27 +184,29 @@ export class NftMintProcessor {
           `Transaction confirmed: ${receipt?.hash} for order ${orderId}`,
         );
 
-        await this.processTransaction(receipt, orderId, worker);
+        await this.processTransaction(receipt, orderId, account);
+
+        // Release account
+        await this.accountsService.releaseAccount(account.id);
       } catch (error) {
-        // Handle error and mark order as failed
         this.logger.error(
           `Error processing order ${orderId}: ${error.message}`,
           error.stack,
         );
 
-        // Mark order as failed
-        await this.ordersService.failOrder(orderId, error.message);
+        // Add to retry queue instead of marking as failed immediately
+        await this.retryService.addToRetryQueue(orderId, error.message);
 
-        // Update worker stats for failed transaction
-        await this.walletsService.trackFailedMint(worker.id);
+        // Update account stats for failed transaction
+        await this.accountsService.trackFailedMint(account.id);
 
         // Update batch stats if this order is part of a batch
         if (order.batchId) {
           await this.batchService.incrementFailedOrders(order.batchId);
         }
 
-        // Release worker
-        await this.walletsService.releaseWorker(worker.id);
+        // Release account
+        await this.accountsService.releaseAccount(account.id);
 
         throw error;
       }
@@ -245,7 +302,7 @@ export class NftMintProcessor {
   async processTransaction(
     receipt: ethers.TransactionReceipt | null,
     orderId: string,
-    worker: Worker,
+    account: Account,
   ) {
     if (!receipt) {
       throw new Error('Transaction receipt is null');
@@ -268,7 +325,7 @@ export class NftMintProcessor {
 
     await this.ordersService.completeOrder(orderId, receipt.hash, tokenId);
     await this.walletsService.trackSuccessfulMint(
-      worker.id,
+      account.id,
       receipt.gasUsed.toString(),
     );
   }

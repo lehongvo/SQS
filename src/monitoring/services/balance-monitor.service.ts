@@ -1,89 +1,146 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { JsonRpcProvider, Transaction, Wallet } from 'ethers';
+import { JsonRpcProvider, Wallet } from 'ethers';
 import { PrismaService } from '../../prisma/prisma.service';
-import { Worker } from '@prisma/client';
+import { Account } from '@prisma/client';
+import { Cron } from '@nestjs/schedule';
 
 @Injectable()
 export class BalanceMonitorService {
   private readonly logger = new Logger(BalanceMonitorService.name);
-  private readonly provider: JsonRpcProvider;
   private readonly minBalance: number;
 
   constructor(
-    private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
+    private readonly provider: JsonRpcProvider,
+    private readonly configService: ConfigService,
   ) {
-    const rpcUrl = this.configService.get<string>('NEXT_PUBLIC_RPC_URL');
-    this.provider = new JsonRpcProvider(rpcUrl);
-    this.minBalance = this.configService.get<number>('WORKER_MIN_BALANCE', 0.1);
+    this.minBalance = this.configService.get<number>(
+      'ACCOUNT_MIN_BALANCE',
+      0.1,
+    );
+  }
+
+  @Cron('*/5 * * * *') // Run every 5 minutes
+  async checkBalances() {
+    this.logger.log('Starting balance check for all accounts...');
+
+    try {
+      const accounts = await this.prisma.account.findMany({
+        where: {
+          status: {
+            not: 'DISABLED',
+          },
+        },
+      });
+
+      for (const account of accounts) {
+        try {
+          const balance = await this.provider.getBalance(account.address);
+          const balanceInEth = balance.toString();
+
+          if (balanceInEth !== account.balance) {
+            this.logger.log(
+              `Balance changed for account ${account.address}: ${account.balance} -> ${balanceInEth}`,
+            );
+
+            await this.prisma.account.update({
+              where: { id: account.id },
+              data: {
+                balance: balanceInEth,
+              },
+            });
+          }
+        } catch (error) {
+          this.logger.error(
+            `Failed to check balance for account ${account.address}: ${error.message}`,
+            error.stack,
+          );
+        }
+      }
+
+      this.logger.log('Balance check completed');
+    } catch (error) {
+      this.logger.error(
+        `Failed to check balances: ${error.message}`,
+        error.stack,
+      );
+    }
   }
 
   async monitorWorkerBalances() {
     try {
-      const workers = await this.prisma.worker.findMany({
+      const accounts = await this.prisma.account.findMany({
         where: {
-          status: 'AVAILABLE',
+          status: {
+            not: 'DISABLED',
+          },
         },
       });
 
-      for (const worker of workers) {
-        await this.checkWorkerBalance(worker);
+      for (const account of accounts) {
+        await this.checkWorkerBalance(account);
       }
     } catch (error) {
-      this.logger.error('Error monitoring worker balances:', error);
-      throw error;
+      this.logger.error(
+        `Failed to monitor account balances: ${error.message}`,
+        error.stack,
+      );
     }
   }
 
-  private async checkWorkerBalance(worker: Worker) {
+  private async checkWorkerBalance(account: Account) {
     try {
-      const balance = await this.provider.getBalance(worker.address);
+      const balance = await this.provider.getBalance(account.address);
       const balanceInEth = Number(balance) / 1e18;
 
       if (balanceInEth < this.minBalance) {
-        await this.topUpWorker(worker, balanceInEth);
+        this.logger.warn(
+          `Account ${account.address} balance (${balanceInEth} ETH) is below minimum (${this.minBalance} ETH)`,
+        );
+        await this.topUpWorker(account, balanceInEth);
       }
 
-      await this.prisma.worker.update({
-        where: { id: worker.id },
+      await this.prisma.account.update({
+        where: { id: account.id },
         data: {
           balance: balance.toString(),
-          updatedAt: new Date(),
         },
       });
     } catch (error) {
       this.logger.error(
-        `Error checking balance for worker ${worker.id}:`,
-        error,
+        `Failed to check balance for account ${account.address}: ${error.message}`,
+        error.stack,
       );
-      throw error;
     }
   }
 
-  private async topUpWorker(worker: Worker, currentBalance: number) {
+  private async topUpWorker(account: Account, currentBalance: number) {
     try {
       const privateKey = this.configService.get<string>('PRIVATE_KEY');
       if (!privateKey) {
         throw new Error('PRIVATE_KEY not configured');
       }
 
-      const masterWallet = new Wallet(privateKey, this.provider);
+      const wallet = new Wallet(privateKey, this.provider);
+      const topUpAmount = this.minBalance - currentBalance + 0.01; // Add 0.01 ETH buffer
 
-      const topUpAmount = (this.minBalance - currentBalance + 0.1) * 1e18;
-      const tx = await masterWallet.sendTransaction({
-        to: worker.address,
-        value: BigInt(Math.floor(topUpAmount)),
+      const tx = await wallet.sendTransaction({
+        to: account.address,
+        value: BigInt(Math.floor(topUpAmount * 1e18)),
       });
 
-      await tx.wait();
-
       this.logger.log(
-        `Topped up worker ${worker.id} with ${topUpAmount / 1e18} ETH`,
+        `Topping up account ${account.address} with ${topUpAmount} ETH (tx: ${tx.hash})`,
       );
+
+      await tx.wait();
+      this.logger.log(`Top-up transaction confirmed: ${tx.hash}`);
     } catch (error) {
-      this.logger.error(`Error topping up worker ${worker.id}:`, error);
-      throw error;
+      this.logger.error(
+        `Failed to top up account ${account.address}: ${error.message}`,
+        error.stack,
+      );
     }
   }
 }

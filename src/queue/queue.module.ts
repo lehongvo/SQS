@@ -2,29 +2,39 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { BullModule } from '@nestjs/bull';
 import { QueueService } from './services/queue.service';
-import { BatchProcessingModule } from '../batch-processing/batch-processing.module';
-import { NftMintQueueProcessor } from './processors/nft-mint.processor';
+import { RetryService } from './services/retry.service';
+import { RetryProcessor } from './processors/retry.processor';
+import { OrdersModule } from '../orders/orders.module';
 
 @Module({
   imports: [
     ConfigModule,
     BullModule.forRootAsync({
       imports: [ConfigModule],
-      useFactory: (configService: ConfigService) => ({
+      useFactory: async (configService: ConfigService) => ({
         redis: {
-          host: configService.get('REDIS_HOST', 'localhost'),
-          port: parseInt(configService.get('REDIS_PORT', '6379')),
-          password: configService.get('REDIS_PASSWORD', ''),
+          host: configService.get('REDIS_HOST'),
+          port: configService.get('REDIS_PORT'),
+          password: configService.get('REDIS_PASSWORD'),
         },
       }),
       inject: [ConfigService],
     }),
-    BullModule.registerQueue({
-      name: 'nft-mint',
-    }),
-    BatchProcessingModule,
+    BullModule.registerQueue(
+      {
+        name: 'nft-mint',
+      },
+      {
+        name: 'retry-queue',
+        defaultJobOptions: {
+          removeOnComplete: true,
+          removeOnFail: false,
+        },
+      },
+    ),
+    OrdersModule,
   ],
-  providers: [QueueService, NftMintQueueProcessor],
-  exports: [QueueService, BullModule],
+  providers: [QueueService, RetryService, RetryProcessor],
+  exports: [QueueService, RetryService],
 })
 export class QueueModule {}
