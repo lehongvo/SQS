@@ -37,7 +37,11 @@ export class BatchProcessingService {
 
       // Update all orders to PROCESSING
       for (const orderId of orderIds) {
-        await this.ordersService.updateOrderStatus(orderId, OrderStatus.PROCESSING, { batchId });
+        await this.ordersService.updateOrderStatus(
+          orderId,
+          OrderStatus.PROCESSING,
+          { batchId },
+        );
       }
 
       this.logger.log(

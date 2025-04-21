@@ -255,7 +255,8 @@ async function processBatchOrders(orderIds: string[]): Promise<void> {
 
     // Check worker balance
     const balance = await provider.getBalance(worker.address);
-    const estimatedGasNeeded = ethers.parseEther('0.01') * BigInt(orderIds.length);
+    const estimatedGasNeeded =
+      ethers.parseEther('0.01') * BigInt(orderIds.length);
     if (balance < estimatedGasNeeded) {
       await publishAlert(
         'Low Worker Balance for Batch',
@@ -538,7 +539,7 @@ async function signTransactionWithKMS(
 
   // In a real implementation, this would be replaced with KMS signing logic
   const randomWallet = ethers.Wallet.createRandom();
-  
+
   // Fix the way we create an Ethers Transaction object
   const tx = ethers.Transaction.from(transaction);
   const signedTx = await randomWallet.signTransaction(tx);

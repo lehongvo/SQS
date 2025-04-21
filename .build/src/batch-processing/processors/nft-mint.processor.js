@@ -62,6 +62,7 @@ let NftMintProcessor = NftMintProcessor_1 = class NftMintProcessor {
             throw error;
         }
     }
+
     async processIndividualOrder(orderId, contract, nonce, wallet, provider) {
         try {
             const order = await this.ordersService.findById(orderId);
@@ -221,6 +222,6 @@ exports.NftMintProcessor = NftMintProcessor;
 exports.NftMintProcessor = NftMintProcessor = NftMintProcessor_1 = __decorate([
     (0, common_1.Injectable)(),
     __metadata("design:paramtypes", [orders_service_1.OrdersService,
-        wallets_service_1.WalletsService])
+    wallets_service_1.WalletsService])
 ], NftMintProcessor);
 //# sourceMappingURL=nft-mint.processor.js.map

@@ -5,10 +5,7 @@ import { BatchProcessingService } from './batch-processing.service';
 import { NftMintProcessor } from './processors/nft-mint.processor';
 
 @Module({
-  imports: [
-    OrdersModule,
-    WalletsModule,
-  ],
+  imports: [OrdersModule, WalletsModule],
   providers: [BatchProcessingService, NftMintProcessor],
   exports: [BatchProcessingService],
 })
